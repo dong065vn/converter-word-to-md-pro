@@ -1,0 +1,38 @@
+{
+  "api": {
+    "openai": {
+      "api_key": "",
+      "model": "gpt-4o",
+      "max_tokens": 4096
+    },
+    "claude": {
+      "api_key": "",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 4096
+    },
+    "opencode": {
+      "api_key": "",
+      "model": "gpt-4o",
+      "base_url": "https://api.openai.com/v1",
+      "max_tokens": 4096
+    },
+    "custom": {
+      "api_key": "",
+      "model": "",
+      "base_url": "",
+      "max_tokens": 4096
+    }
+  },
+  "conversion": {
+    "chunk_size": 5000,
+    "use_phases": true,
+    "auto_merge": true,
+    "verify_output": true
+  },
+  "translation": {
+    "chunk_size": 3000,
+    "max_retries": 5,
+    "source_lang": "en",
+    "target_lang": "vi"
+  }
+}
