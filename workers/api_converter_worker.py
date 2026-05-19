@@ -125,65 +125,113 @@ class APIConverterWorker(QThread):
             self.warning.emit(filepath, "Không trích xuất được text từ file")
             return None
 
-        # Step 2: Chunk text
-        self.log.emit(f"  📋 Chunking ({len(raw_text)} chars)...")
-        chunker = SmartChunker(max_chars=self.chunk_size)
-        chunks = chunker.create_chunks(raw_text)
-        self.log.emit(f"  📋 {len(chunks)} chunks")
+        # Step 2: Extract text into semantic blocks
+        from core.ast_tools.extractor import BlockExtractor
+        from core.ast_tools.models import MarkdownBlock
+        self.log.emit(f"  📋 Extracting semantic blocks...")
+        source_blocks = BlockExtractor.extract_source_blocks(raw_text, filepath)
+        self.log.emit(f"  📋 {len(source_blocks)} raw blocks found")
 
-        # Step 3: Process each chunk via API
+        # Group blocks into chunks of ~chunk_size
+        batches = []
+        current_batch = []
+        current_len = 0
+        for sb in source_blocks:
+            sb_len = len(sb.text)
+            if current_len + sb_len > self.chunk_size and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_len = 0
+            current_batch.append(sb)
+            current_len += sb_len
+        if current_batch:
+            batches.append(current_batch)
+
+        # Step 3: Process each batch via API
         system_prompt = client.build_conversion_prompt()
-        processed_chunks = []
+        system_prompt += "\n\nCRITICAL INSTRUCTION: You MUST return ONLY a JSON object matching this schema exactly: {\"blocks\": [{\"block_id\": \"b1\", \"markdown\": \"...\"}]}. The block_id in your response must match the block_id provided in the input JSON exactly."
+        
+        processed_markdown_blocks = []
+        phase_mds = []
 
-        for chunk in chunks:
+        for idx, batch in enumerate(batches):
             if self._cancelled:
                 break
 
-            self.log.emit(f"  🤖 API chunk {chunk.id}/{len(chunks)}...")
-            pct_detail = f"Chunk {chunk.id}/{len(chunks)}"
+            self.log.emit(f"  🤖 API batch {idx+1}/{len(batches)}...")
+            
+            # Prepare user content as JSON
+            batch_data = [{"block_id": b.block_id, "text": b.text} for b in batch]
+            user_content = "CONVERT THESE BLOCKS TO MARKDOWN. RETURN JSON ONLY:\n" + json.dumps(batch_data, ensure_ascii=False)
 
-            # Build user content with context
-            user_content = ""
-            context_section = client.build_context_section(
-                chunk.context_before, chunk.context_after
-            )
-            if context_section:
-                user_content += context_section + "\n"
-            user_content += f"TEXT TO CONVERT:\n---START---\n{chunk.text}\n---END---"
-
+            batch_md_output = ""
             try:
                 result = client.process_with_retry(system_prompt, user_content)
-                chunk.text = result  # Replace with API-formatted version
-                processed_chunks.append(chunk)
-                self.log.emit(f"    ✅ Chunk {chunk.id}: {len(result)} chars")
+                # Clean markdown code blocks if the AI surrounded the JSON with ```json ... ```
+                if result.strip().startswith("```"):
+                    lines = result.strip().split("\n")
+                    result = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+                    
+                parsed_json = json.loads(result)
+                
+                if "blocks" in parsed_json:
+                    for mb in parsed_json["blocks"]:
+                        processed_markdown_blocks.append(MarkdownBlock(**mb))
+                        batch_md_output += mb.get("markdown", "") + "\n\n"
             except Exception as e:
-                self.warning.emit(filepath, f"Chunk {chunk.id} failed: {e}")
-                processed_chunks.append(chunk)  # Keep original
+                self.warning.emit(filepath, f"Batch {idx+1} failed or invalid JSON: {e}")
+                # Fallback: keep original text
+                for b in batch:
+                    processed_markdown_blocks.append(MarkdownBlock(block_id=b.block_id, markdown=b.text))
+                    batch_md_output += b.text + "\n\n"
+                    
+            phase_mds.append(batch_md_output)
 
         # Step 4: Emit phases if requested
         if self.use_phases:
             phase_dir = os.path.join(self.output_dir, f"{stem}_phases")
             os.makedirs(phase_dir, exist_ok=True)
-            for chunk in processed_chunks:
-                phase_path = os.path.join(phase_dir, f"{stem}_phase_{chunk.id:03d}.md")
+            for idx, batch_md in enumerate(phase_mds):
+                phase_path = os.path.join(phase_dir, f"{stem}_phase_{idx:03d}.md")
                 with open(phase_path, "w", encoding="utf-8") as f:
-                    f.write(chunk.text)
-                preview = chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text
-                self.phase_created.emit(chunk.id, phase_path, preview)
+                    f.write(batch_md)
+                preview = batch_md[:200] + "..." if len(batch_md) > 200 else batch_md
+                self.phase_created.emit(idx, phase_path, preview)
 
         # Step 5: Merge
-        merged_md = SmartMerger.merge_chunks(processed_chunks)
+        merged_md = "\n\n".join(mb.markdown for mb in processed_markdown_blocks)
         output_path = os.path.join(self.output_dir, f"{stem}.md")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(merged_md)
 
         # Step 6: Verify
         if self.verify:
+            # Legacy verify
             result = QualityValidator.verify_conversion(filepath, merged_md, raw_text)
+            
+            # New AST-based verify
+            from core.ast_tools.validate_markdown_structure import MarkdownValidator
+            from core.ast_tools.compare_source_vs_markdown import ContentComparator
+            
+            ast_validator = MarkdownValidator()
+            issues = ast_validator.validate_blocks(processed_markdown_blocks)
+            for iss in issues:
+                self.warning.emit(filepath, f"AST: {iss.message}")
+                
+            comparator = ContentComparator()
+            alignments = comparator.compare(source_blocks, processed_markdown_blocks)
+            high_risk_count = 0
+            for align in alignments:
+                if align.suspected_rewrite and align.risk == "high":
+                    high_risk_count += 1
+                    
+            if high_risk_count > 0:
+                self.warning.emit(filepath, f"Phát hiện {high_risk_count} blocks có rủi ro điêu tiếng/sai số liệu!")
+
             if result.warnings:
                 for w in result.warnings:
                     self.warning.emit(filepath, w)
-            self.log.emit(f"  📊 Quality: {result.overall_score:.0%}")
+            self.log.emit(f"  📊 Quality: {result.overall_score:.0%} | Lỗi AST: {len(issues)}")
 
         self.file_completed.emit(filepath, output_path)
         self.log.emit(f"  ✅ Done (API): {filename} → {Path(output_path).name}")
